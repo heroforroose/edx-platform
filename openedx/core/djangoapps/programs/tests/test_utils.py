@@ -43,7 +43,7 @@ from openedx.core.djangoapps.programs.utils import (
     get_certificates,
     get_logged_in_program_certificate_url
 )
-from openedx.core.djangoapps.site_configuration.tests.factories import SiteFactory
+from openedx.core.djangoapps.site_configuration.tests.factories import SiteFactory, SiteConfigurationFactory
 from openedx.core.djangolib.testing.utils import skip_unless_lms
 from student.tests.factories import AnonymousUserFactory, CourseEnrollmentFactory, UserFactory
 from util.date_utils import strftime_localized
@@ -67,6 +67,7 @@ class TestProgramProgressMeter(TestCase):
 
         self.user = UserFactory()
         self.site = SiteFactory()
+        self.site_configuration = SiteConfigurationFactory(site=self.site)
 
     def _create_enrollments(self, *course_run_ids):
         """Variadic helper used to create course run enrollments."""
@@ -610,6 +611,37 @@ class TestProgramProgressMeter(TestCase):
         )
         self.assertEqual(meter.completed_programs_with_available_dates.keys(), [program_uuid])
 
+    def test_completed_programs_with_available_dates(self, mock_get_programs):
+        """
+        Course runs aren't necessarily of type verified. Verify that a program can
+        still be completed when this is the case.
+        """
+        course_run_key = generate_course_run_key()
+        data = [
+            ProgramFactory(
+                courses=[
+                    CourseFactory(course_runs=[
+                        CourseRunFactory(key=course_run_key, type='honor'),
+                        CourseRunFactory(),
+                    ]),
+                ]
+            ),
+            ProgramFactory(),
+        ]
+        mock_get_programs.return_value = data
+
+        self._create_enrollments(course_run_key)
+        self._create_certificates(course_run_key)
+        meter = ProgramProgressMeter(self.site, self.user)
+
+        program, program_uuid = data[0], data[0]['uuid']
+        self._assert_progress(
+            meter,
+            ProgressFactory(uuid=program_uuid, completed=1, grades={course_run_key: 0.0})
+        )
+        self.assertEqual(meter.completed_programs_with_available_dates.keys(), [program_uuid])
+
+
     @mock.patch(UTILS_MODULE + '.available_date_for_certificate')
     def test_completed_programs_with_available_dates(self, mock_available_date_for_certificate, mock_get_programs):
         # First we want to set up the scenario:
@@ -654,6 +686,27 @@ class TestProgramProgressMeter(TestCase):
         self.assertDictEqual(available_dates, {
             program_complete['uuid']: datetime.datetime(2017, 1, 1)
         })
+
+    def test_program_completion_with_skipped_program(self, mock_get_programs):
+        """
+        Verify that if we add program's uuid in site configuration then it will be skipped for certificates.
+        """
+        course_runs = CourseRunFactory.create_batch(2, type=CourseMode.PROFESSIONAL)
+        program = ProgramFactory(courses=[CourseFactory(course_runs=course_runs)])
+        mock_get_programs.return_value = [program]
+        self._create_enrollments(course_runs[0]['key'])
+        self._create_certificates(course_runs[0]['key'], mode=CourseMode.NO_ID_PROFESSIONAL_MODE)
+
+        # Verify that the program is complete.
+        meter = ProgramProgressMeter(self.site, self.user)
+        self.assertEqual(meter.completed_programs_with_available_dates.keys(), [program['uuid']])
+
+        # we skipped the programs if we add it in site configuration
+        self.site_configuration.values = {
+            "programs_without_certificates": [program['uuid']]
+        }
+        self.site_configuration.save()
+        self.assertEqual(meter.completed_programs_with_available_dates.keys(), [])
 
     def test_completed_course_runs(self, mock_get_programs):
         """
